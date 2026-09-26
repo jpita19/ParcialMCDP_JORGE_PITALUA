@@ -1,0 +1,29 @@
+# No se necesita nada de esto dentro de la imagen: el modelo ya viene
+# entrenado (models/modelo.joblib), asi que ni los datos crudos ni el
+# historial de git deben viajar dentro del contenedor.
+.git/
+.gitattributes
+.gitignore
+
+data/
+*.csv
+notebooks/
+.ipynb_checkpoints/
+
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+
+.vscode/
+.idea/
+
+ENUNCIADO_PARCIAL.md
+README.md
+respuestas_ocultas_PROFESOR.csv

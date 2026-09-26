@@ -5,7 +5,7 @@ Servicio que clasifica el estado de una GPU NVIDIA L40 (`normal`,
 de una ventana de telemetría, empaquetado como una API FastAPI dentro de un
 contenedor Docker.
 
-## Estructura del repositorio (objetivo)
+## Estructura del repositorio
 
 ```
 src/
@@ -17,13 +17,41 @@ data/
   telemetria_publica.csv   # dataset de entrenamiento
 models/
   modelo.joblib  # pipeline entrenado y serializado (se genera con train.py)
+notebooks/
+  comparacion_modelos.ipynb  # por qué Random Forest (no forma parte del servicio)
 Dockerfile
 .dockerignore
 requirements.txt
 ```
 
-Este README se va llenando a medida que se construye cada pieza; por ahora
-solo está listo el dato crudo y su análisis exploratorio.
+## Cómo correrlo
+
+### Con Docker (lo que se evalúa)
+
+El repo ya incluye `models/modelo.joblib` entrenado, así que basta con:
+
+```bash
+docker build -t detector-gpu .
+docker run -p 8000:8000 detector-gpu
+```
+
+Y quedará respondiendo en http://localhost:8000/docs (Swagger UI generado
+por FastAPI, para probar `/predecir` a mano).
+
+### Reentrenar el modelo (opcional, fuera del contenedor)
+
+El contenedor **nunca entrena**; el `.joblib` se genera antes de construir la
+imagen:
+
+```bash
+pip install -r requirements.txt
+python src/train.py
+```
+
+Esto valida `data/telemetria_publica.csv` (pandera), lo ventanea, calcula
+features, entrena un `RandomForestClassifier`, evalúa con un split de
+episodios nunca vistos, y sobrescribe `models/modelo.joblib` con el pipeline
+final (reentrenado sobre todos los episodios disponibles).
 
 ## Análisis exploratorio de los datos (EDA)
 
