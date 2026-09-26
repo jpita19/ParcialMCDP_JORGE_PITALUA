@@ -145,3 +145,57 @@ features — están explícitamente fuera de la lista `SEÑALES`. El orden de la
 `api.py` arman su DataFrame de entrada llamando a esa misma función (nunca
 `dict.keys()` de un dict cualquiera), para que el orden de columnas que ve
 el modelo sea siempre el mismo.
+
+## Entrenamiento y serialización (`src/train.py`, Parte A.3)
+
+`train.py` conecta todo lo anterior: valida → separa **episodios** en
+train/test (estratificado por estado, nunca por ventana — misma razón que el
+ventaneo: evitar que ventanas casi idénticas del mismo episodio caigan una en
+cada lado) → ventanea + calcula features → entrena → evalúa → **reentrena
+sobre los 48 episodios completos** → serializa.
+
+Se serializa con `joblib` un solo artefacto (`models/modelo.joblib`) que
+contiene:
+- `pipeline`: `Pipeline(StandardScaler -> RandomForestClassifier)` completo
+  (no solo el clasificador — el preprocesamiento viaja con el modelo).
+- `feature_names`: el orden exacto de columnas usado al entrenar (la API lo
+  lee de acá en vez de asumir que coincide con `features.nombres_features()`,
+  una capa extra de seguridad contra usar features distintas en train y api).
+- `clases`: las clases del clasificador.
+- `tam_ventana_entrenamiento`: metadato informativo (30s).
+
+**Resultado de la validación honesta** (36 episodios de train / 12 de test,
+nunca mezclados): **accuracy = 100%** sobre los episodios de test.
+Consistente con el EDA: las cuatro clases están muy bien separadas en el
+espacio de features.
+
+**¿Por qué reentrenar sobre los 48 episodios en vez de quedarse con el
+modelo evaluado en 36?** Con un dataset tan chico, no tiene sentido dejar 12
+episodios (25%) fuera del modelo que finalmente se empaqueta — la validación
+honesta ya se hizo con el split anterior, así que una vez medida la
+generalización, el modelo final aprovecha el 100% de los datos disponibles.
+
+### ¿Por qué Random Forest y no otro clasificador?
+
+No fue el resultado de una competencia reñida. En
+[`notebooks/comparacion_modelos.ipynb`](notebooks/comparacion_modelos.ipynb)
+se entrenan 5 clasificadores distintos sobre el mismo split de episodios (los
+mismos 36 train / 12 test, `random_state=42`):
+
+| modelo | accuracy test | F1 macro test | tiempo fit | tiempo predict (119 ventanas) |
+|---|---|---|---|---|
+| **RandomForest (el elegido)** | 1.0 | 1.0 | 0.82s | 0.078s |
+| GradientBoosting | 1.0 | 1.0 | 1.23s | 0.005s |
+| LogisticRegression | 1.0 | 1.0 | 0.03s | 0.003s |
+| SVM (RBF) | 1.0 | 1.0 | 0.02s | 0.003s |
+| KNN (k=5) | 1.0 | 1.0 | 0.004s | 2.80s |
+
+Los cinco empatan en 100% porque las clases están tan separadas en el
+espacio de features (ver EDA) que casi cualquier clasificador razonable las
+resuelve — Random Forest no le ganó a nadie acá. Se mantuvo como elección
+por: robustez esperada ante datos más ruidosos que los del examen oculto
+(traza fronteras no lineales por umbrales sin diseñar interacciones a mano),
+`feature_importances_` nativo (usado para identificar qué feature delata
+cada falla, ver sustentación), `predict_proba` sin calibración extra
+(necesario para `confianza`), y cero necesidad de tuning. La diferencia real
+entre modelos es velocidad de entrenamiento, irrelevante para 358 ventanas.
