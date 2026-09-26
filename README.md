@@ -279,3 +279,24 @@ confirmar que el contenedor ya cargó el modelo.
 - `api.py` agrega su propio directorio a `sys.path` antes de importar
   `features`/`schema`, para no depender de si el proceso se levanta como
   `uvicorn api:app --app-dir src` o de otra forma.
+
+## Las trampas evitadas
+
+- **No se mete `estado`, `segundo` ni `episodio_id` como feature** —
+  `SEÑALES` en [`features.py`](src/features.py) las excluye explícitamente;
+  el primero es la etiqueta (fuga de información), los otros dos son
+  identificadores de fila, no telemetría.
+- **Las mismas features en train y api** — [`train.py`](src/train.py) y
+  [`api.py`](src/api.py) llaman a las mismas funciones de
+  [`features.py`](src/features.py) (`calcular_features`, `nombres_features`),
+  nunca hay una segunda implementación que pueda divergir. El propio artefacto
+  serializado (`modelo.joblib`) además guarda `feature_names`, así que la API
+  reordena sus columnas según lo que el modelo realmente aprendió, no según
+  lo que el código actual de `features.py` "cree" que debería ser.
+- **El ventaneo nunca cruza episodios** — `crear_ventanas` agrupa por
+  `episodio_id` antes de cortar ventanas; ninguna ventana mezcla segundos de
+  dos episodios distintos.
+- **El contenedor trae el modelo ya entrenado** — `models/modelo.joblib` se
+  genera con `python src/train.py` **antes** de construir la imagen; el
+  `Dockerfile` solo lo copia (`COPY models/ ./models/`) y nunca ejecuta
+  `train.py` ni tiene acceso a `data/` (excluido en `.dockerignore`).
