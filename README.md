@@ -38,6 +38,17 @@ docker run -p 8000:8000 detector-gpu
 Y quedará respondiendo en http://localhost:8000/docs (Swagger UI generado
 por FastAPI, para probar `/predecir` a mano).
 
+### Probar los 4 estados con datos reales
+
+Con la API arriba (Docker o local), `scripts/probar_api.py` manda una
+ventana real de cada estado (tomadas de `data/telemetria_publica.csv`) al
+endpoint `/predecir`, más una ventana de 3 lecturas para confirmar que se
+rechaza con `422`:
+
+```bash
+python scripts/probar_api.py
+```
+
 ### Reentrenar el modelo (opcional, fuera del contenedor)
 
 El contenedor **nunca entrena**; el `.joblib` se genera antes de construir la
