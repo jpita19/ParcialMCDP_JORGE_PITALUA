@@ -107,3 +107,41 @@ con el resto del esquema).
   exactamente qué filas violan qué regla, las descarta, y valida de nuevo el
   resto en modo estricto (si la cuarentena no alcanza, ahí sí se propaga el
   error).
+
+## El pipeline de features (`src/features.py`, Parte A.1)
+
+```
+telemetria cruda (validada)  ->  ventanas de 30s  ->  features  ->  (train.py | api.py)
+```
+
+Este módulo lo importan **tanto `train.py` como `api.py`**: es el único lugar
+donde se calculan features, para que el modelo nunca reciba algo distinto en
+producción de lo que vio al entrenar (la trampa #2 del enunciado).
+
+**Ventaneo (`crear_ventanas`):** cada `episodio_id` se corta en ventanas de
+30 segundos **no solapadas** — segundos 0-29, 30-59, 60-89, etc. Cada segundo
+del episodio cae en una sola ventana. Se prefirió esto sobre un *sliding
+window* solapado (por ejemplo, avanzando de a 5 segundos) porque dos
+ventanas solapadas comparten la mayoría de sus segundos y son casi idénticas
+entre sí: "infla" el número de muestras sin agregar información real, y si
+alguna vez se separara train/test por ventana en lugar de por episodio,
+ventanas casi iguales podrían quedar una en cada lado e inflar el accuracy
+de forma artificial. Con 48 episodios × 10 ventanas de 30s salen 480
+ventanas en total — suficiente para este dataset (accuracy 100% en test, ver
+más abajo). Las ventanas incompletas al final de un episodio se descartan.
+Si un episodio terminara con más de un `estado` dentro de una misma ventana
+(no debería pasar nunca), la función lanza un error en vez de asignar el
+estado mayoritario en silencio.
+
+**Features (`calcular_features`):** por cada señal (`temp_c`, `power_w`,
+`util_pct`, `clock_mhz`, `ecc_errors`) se calculan `mean`, `std`, `min`,
+`max` y `range` (max−min); más un feature extra, `ecc_errors_total` (la
+suma, no solo el promedio), porque lo que delata `degradacion_memoria` es
+que los errores ECC *se acumulan* en la ventana. 26 features en total.
+
+**Sin fuga de información:** `estado`, `segundo` y `episodio_id` nunca son
+features — están explícitamente fuera de la lista `SEÑALES`. El orden de las
+26 columnas está fijo en `nombres_features()`, y tanto `train.py` como
+`api.py` arman su DataFrame de entrada llamando a esa misma función (nunca
+`dict.keys()` de un dict cualquiera), para que el orden de columnas que ve
+el modelo sea siempre el mismo.
