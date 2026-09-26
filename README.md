@@ -199,3 +199,55 @@ por: robustez esperada ante datos más ruidosos que los del examen oculto
 cada falla, ver sustentación), `predict_proba` sin calibración extra
 (necesario para `confianza`), y cero necesidad de tuning. La diferencia real
 entre modelos es velocidad de entrenamiento, irrelevante para 358 ventanas.
+
+## La API (`src/api.py`, Parte B)
+
+### `POST /predecir`
+
+```bash
+curl -X POST http://localhost:8000/predecir \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lecturas": [
+      {"temp_c": 88.3, "power_w": 296.5, "util_pct": 95.8, "clock_mhz": 2038, "ecc_errors": 0},
+      {"temp_c": 89.8, "power_w": 298.9, "util_pct": 95.4, "clock_mhz": 2091, "ecc_errors": 1}
+      /* ... al menos 10 lecturas ... */
+    ]
+  }'
+```
+
+```json
+{"estado_predicho": "sobrecalentamiento", "confianza": 0.98}
+```
+
+Internamente: `VentanaTelemetria` (Pydantic) valida forma, tipos, rangos
+físicos y tamaño mínimo -> `features.calcular_features` (el mismo módulo de
+`train.py`) -> se reordenan las columnas según `feature_names` del artefacto
+serializado -> `pipeline.predict_proba` -> se responde la clase de mayor
+probabilidad y esa probabilidad como `confianza`.
+
+### `GET /salud`
+
+Health check simple (`{"status": "ok", "modelo_cargado": true}`), útil para
+confirmar que el contenedor ya cargó el modelo.
+
+### Validación en la puerta (Parte B.2)
+
+- Cada `Lectura` exige los 5 campos, del tipo correcto y en rango físico —
+  los mismos límites del contrato de pandera (`schema.py`), importados como
+  constantes en vez de repetir los números, para que ambas validaciones
+  queden sincronizadas si algún rango cambia.
+- `VentanaTelemetria.lecturas` exige **mínimo `features.MIN_LECTURAS` (10)**
+  lecturas: con menos, la desviación estándar de la ventana no es confiable
+  y el modelo recibiría features de mala calidad.
+- Si algo no cumple, FastAPI responde `422` con el detalle exacto del campo
+  que falló, **sin tocar el modelo**.
+
+### Detalles de implementación
+
+- El modelo se carga una sola vez al arrancar el proceso con un `lifespan`
+  (`@asynccontextmanager`), el patrón vigente de FastAPI para código de
+  startup/shutdown (`@app.on_event` está en camino de deprecarse).
+- `api.py` agrega su propio directorio a `sys.path` antes de importar
+  `features`/`schema`, para no depender de si el proceso se levanta como
+  `uvicorn api:app --app-dir src` o de otra forma.

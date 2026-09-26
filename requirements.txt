@@ -4,3 +4,6 @@ pandera==0.33.1
 numpy==2.5.1
 scikit-learn==1.8.0
 joblib==1.5.3
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
