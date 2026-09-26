@@ -81,3 +81,29 @@ falla (las mismas que pide el enunciado en A.1):
 Esta tabla es también la razón por la que, más adelante, el modelo entrenado
 llega a 100% de accuracy en el test: las clases casi no se solapan en el
 espacio de las features que se calculan a partir de estas señales.
+
+## Validación de datos (`src/schema.py`)
+
+Contrato de pandera sobre la telemetría cruda: rangos físicos para una L40
+(`temp_c` 0–120°C, `power_w` 0–500W, `util_pct` 0–100%, `clock_mhz`
+0–3500MHz, `ecc_errors` ≥ 0) y `estado` restringido a los cuatro valores
+válidos del enunciado. El límite superior de `power_w` (500W) no sale de
+ningún dato duro — es criterio de ingeniería: la L40 tiene un TDP nominal de
+~300W, y se deja margen para picos transitorios sin abrir la puerta a
+valores absurdos. `Config.strict = False` permite columnas extra en el
+DataFrame sin romper la validación (para no ser más rígidos de lo necesario
+con el resto del esquema).
+
+**Dos modos de validación, a propósito:**
+- `validar_telemetria()` (estricto) — revienta con `SchemaErrors` ante
+  cualquier violación. Es el que usa la API: una ventana mal formada de un
+  cliente se rechaza completa, porque no hay "más datos" con los que
+  arreglarla.
+- `validar_y_limpiar_telemetria()` (cuarentena) — pensado para el CSV de
+  entrenamiento. El dataset público trae 3 filas (de 14,400, ver EDA arriba)
+  con `power_w` negativo por un glitch de sensor durante
+  `falla_alimentacion`. Abortar todo el entrenamiento por un 0.02% de filas
+  dañadas no tiene sentido operativo: esta función reporta por consola
+  exactamente qué filas violan qué regla, las descarta, y valida de nuevo el
+  resto en modo estricto (si la cuarentena no alcanza, ahí sí se propaga el
+  error).

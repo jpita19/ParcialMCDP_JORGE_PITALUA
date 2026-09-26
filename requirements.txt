@@ -1,0 +1,3 @@
+# Se va completando a medida que cada modulo de src/ lo necesita.
+pandas==3.0.2
+pandera==0.33.1
