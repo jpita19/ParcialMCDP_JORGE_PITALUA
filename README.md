@@ -5,6 +5,8 @@ Servicio que clasifica el estado de una GPU NVIDIA L40 (`normal`,
 de una ventana de telemetría, empaquetado como una API FastAPI dentro de un
 contenedor Docker.
 
+**Autor:** Jorge Luis Pitalúa Pantoja
+
 ## Estructura del repositorio
 
 ```
