@@ -6,8 +6,9 @@ API de FastAPI que expone el detector de fallas de GPU.
 Flujo interno del endpoint principal (POST /predecir), tal como pide el
 enunciado:
 
-    ventana (JSON) -> validar (BaseModel) -> calcular features (features.py)
-        -> pipeline.predict -> responder
+    ventana (JSON) -> validar forma y tipos (BaseModel)
+        -> validar rangos fisicos (contrato pandera de schema.py)
+        -> calcular features (features.py) -> pipeline.predict -> responder
 
 `features.py` es el MISMO modulo que usa `train.py`: aqui nunca se
 recalculan a mano las estadisticas de la ventana, para garantizar que el
@@ -32,17 +33,7 @@ from pydantic import BaseModel, Field
 # `uvicorn api:app --app-dir src` o de alguna otra forma.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import features as feat  # noqa: E402
-from schema import (  # noqa: E402
-    CLOCK_MHZ_MAX,
-    CLOCK_MHZ_MIN,
-    ECC_ERRORS_MIN,
-    POWER_W_MAX,
-    POWER_W_MIN,
-    TEMP_C_MAX,
-    TEMP_C_MIN,
-    UTIL_PCT_MAX,
-    UTIL_PCT_MIN,
-)
+from schema import LecturaSchema, poner_en_cuarentena  # noqa: E402
 
 RUTA_BASE = Path(__file__).resolve().parent.parent
 RUTA_MODELO = RUTA_BASE / "models" / "modelo.joblib"
@@ -52,15 +43,20 @@ RUTA_MODELO = RUTA_BASE / "models" / "modelo.joblib"
 # Esquemas de entrada/salida (Parte B.2: validación en la puerta)
 # ---------------------------------------------------------------------------
 class Lectura(BaseModel):
-    """Una lectura de telemetria de un segundo. Los mismos rangos fisicos
-    que exige el contrato de pandera (schema.py) se validan aqui, del lado
-    de la API, para que una lectura mal formada nunca llegue al modelo."""
+    """Una lectura de telemetria de un segundo. Aqui se exige la FORMA: los
+    5 campos presentes y del tipo correcto (si falta uno o viene como texto,
+    la petición entera se rechaza con 422).
 
-    temp_c: float = Field(ge=TEMP_C_MIN, le=TEMP_C_MAX, description="Temperatura en °C")
-    power_w: float = Field(ge=POWER_W_MIN, le=POWER_W_MAX, description="Consumo en vatios")
-    util_pct: float = Field(ge=UTIL_PCT_MIN, le=UTIL_PCT_MAX, description="Utilización en %")
-    clock_mhz: float = Field(ge=CLOCK_MHZ_MIN, le=CLOCK_MHZ_MAX, description="Reloj en MHz")
-    ecc_errors: int = Field(ge=ECC_ERRORS_MIN, description="Errores ECC en ese segundo")
+    Los rangos fisicos NO se validan aqui sino con el contrato de pandera
+    (`schema.LecturaSchema`) dentro de `/predecir`, que descarta solo la
+    lectura fuera de rango en vez de rechazar la ventana completa -- el
+    mismo criterio que se usa al entrenar."""
+
+    temp_c: float = Field(description="Temperatura en °C")
+    power_w: float = Field(description="Consumo en vatios")
+    util_pct: float = Field(description="Utilización en %")
+    clock_mhz: float = Field(description="Reloj en MHz")
+    ecc_errors: int = Field(description="Errores ECC en ese segundo")
 
 
 class VentanaTelemetria(BaseModel):
@@ -121,9 +117,13 @@ def predecir(ventana: VentanaTelemetria) -> PrediccionResponse:
     Recibe una ventana de telemetria (lista de lecturas de un segundo cada
     una, todas de la MISMA GPU/episodio) y devuelve el estado predicho.
 
-    La validación de forma y rangos ya la hizo Pydantic al parsear el
-    request (B.2): si llega aquí, la ventana tiene todos los campos, del
-    tipo correcto, en rango físico, y con al menos `MIN_LECTURAS` lecturas.
+    La validación de forma ya la hizo Pydantic al parsear el request (B.2):
+    si llega aquí, cada lectura tiene todos los campos del tipo correcto y
+    la ventana tiene al menos `MIN_LECTURAS` lecturas. Aquí se aplica además
+    el contrato de pandera: las lecturas fuera de rango físico (p.ej. un
+    glitch de potencia negativa durante una falla de alimentación) se
+    descartan, y si después no quedan `MIN_LECTURAS` válidas se responde 422
+    sin tocar el modelo.
     """
     if _artefacto is None:
         raise HTTPException(status_code=503, detail="El modelo todavía no está cargado.")
@@ -131,6 +131,22 @@ def predecir(ventana: VentanaTelemetria) -> PrediccionResponse:
     # Ventana -> DataFrame con las mismas columnas crudas que espera
     # features.py (el mismo módulo que usó train.py).
     df_ventana = pd.DataFrame([lectura.model_dump() for lectura in ventana.lecturas])
+
+    df_ventana, fallas = poner_en_cuarentena(df_ventana, LecturaSchema)
+    if not fallas.empty:
+        print(
+            f"[predecir] Se descartaron {len(ventana.lecturas) - len(df_ventana)} "
+            "lectura(s) fuera del contrato de datos:\n" + fallas.to_string(index=False)
+        )
+    if len(df_ventana) < feat.MIN_LECTURAS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"La ventana solo tiene {len(df_ventana)} lecturas dentro de rango "
+                f"físico (de {len(ventana.lecturas)} recibidas); se necesitan al menos "
+                f"{feat.MIN_LECTURAS}. Revisa las unidades y los sensores."
+            ),
+        )
 
     features_dict = feat.calcular_features(df_ventana)
     X = feat.features_a_dataframe([features_dict])

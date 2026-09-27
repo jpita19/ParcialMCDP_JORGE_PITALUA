@@ -3,8 +3,9 @@ probar_api.py
 =============
 Prueba manual del endpoint /predecir contra una API ya levantada (con
 Docker o con uvicorn local), usando ventanas REALES del dataset publico
--- una por cada uno de los 4 estados -- mas una ventana corta para
-confirmar que la validacion de la API la rechaza.
+-- una por cada uno de los 4 estados -- mas tres casos de validacion: una
+ventana con un glitch de potencia negativa (debe predecirse igual), una con
+la temperatura en Fahrenheit y una demasiado corta (ambas deben rechazarse).
 
 Uso (con la API corriendo en otra terminal, ver README "Como correrlo"):
 
@@ -81,6 +82,22 @@ def main() -> None:
             print(f"FALLO real={estado:22s} -> HTTP {status}: {respuesta}")
 
     print(f"\n{aciertos}/{len(ESTADOS)} ventanas clasificadas correctamente.\n")
+
+    print("=== falla_alimentacion con una lectura de potencia negativa -- debe predecirse ===")
+    ventana_glitch = (
+        df[df["estado"] == "falla_alimentacion"].iloc[: args.tam_ventana][SEÑALES].to_dict(orient="records")
+    )
+    ventana_glitch[0]["power_w"] = -13.5  # glitch de sensor, como los del dataset publico
+    status, respuesta = post_predecir(args.url, ventana_glitch)
+    esperado = "OK  " if status == 200 and respuesta["estado_predicho"] == "falla_alimentacion" else "FALLO"
+    print(f"{esperado} HTTP {status}: {respuesta}\n")
+
+    print("=== Ventana con temperatura en Fahrenheit -- debe rechazarse con 422 ===")
+    ventana_f = df[df["estado"] == "sobrecalentamiento"].iloc[: args.tam_ventana][SEÑALES].copy()
+    ventana_f["temp_c"] = ventana_f["temp_c"] * 9 / 5 + 32
+    status, respuesta = post_predecir(args.url, ventana_f.to_dict(orient="records"))
+    esperado = "OK  " if status == 422 else "FALLO"
+    print(f"{esperado} HTTP {status}: {respuesta}\n")
 
     print("=== Ventana corta (3 lecturas) -- debe rechazarse con 422 ===")
     ventana_corta = df.iloc[:3][SEÑALES].to_dict(orient="records")

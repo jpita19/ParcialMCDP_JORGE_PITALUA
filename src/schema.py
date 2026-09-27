@@ -3,10 +3,11 @@ schema.py
 =========
 Contrato de datos para la telemetria cruda, usando pandera.
 
-Se valida ANTES de ventanear/entrenar: si la telemetria no cumple el
-contrato, se rechaza aqui y nunca llega al pipeline de features. Esto evita
+Se valida ANTES de calcular features, tanto al entrenar (train.py) como en
+cada ventana que llega a la API (api.py): una lectura que no cumple el
+contrato se descarta aqui y nunca llega al pipeline de features. Esto evita
 que, por ejemplo, un sensor dañado (temperatura negativa, potencia negativa,
-un estado mal escrito) contamine el entrenamiento.
+un estado mal escrito) contamine el entrenamiento o una predicción.
 
 Los rangos fisicos estan pensados para una GPU NVIDIA L40 (TDP ~300W):
 - temp_c: una GPU no opera por debajo de temperatura ambiente ni por encima
@@ -21,7 +22,9 @@ Los rangos fisicos estan pensados para una GPU NVIDIA L40 (TDP ~300W):
 
 Nota para la sustentacion: si el proveedor empieza a mandar temp_c en
 Fahrenheit, la mayoria de esos valores (p.ej. 100-200 F) caen FUERA del
-rango fisico en Celsius que exige `TEMP_C_MAX` y el contrato los rechaza. El
+rango fisico en Celsius que exige `TEMP_C_MAX` y el contrato los descarta
+(si toda la ventana viene asi, la API la rechaza con 422 por quedarse sin
+lecturas validas suficientes). El
 contrato no "sabe" que la unidad cambio, pero si nota que el numero ya no es
 una temperatura Celsius plausible para una GPU. El unico hueco es la franja
 en la que un valor en Fahrenheit coincide por accidente con un rango
@@ -52,11 +55,11 @@ CLOCK_MHZ_MIN, CLOCK_MHZ_MAX = 0.0, 3500.0
 ECC_ERRORS_MIN = 0
 
 
-class TelemetriaSchema(pa.DataFrameModel):
-    """Contrato de datos para una fila de telemetria cruda (un segundo)."""
+class LecturaSchema(pa.DataFrameModel):
+    """Contrato de datos para las señales de una lectura (un segundo), sin
+    identificadores ni etiqueta. Es lo que valida la API sobre cada ventana
+    que recibe, y la base del contrato del CSV de entrenamiento."""
 
-    episodio_id: Series[int] = pa.Field(ge=0, coerce=True)
-    segundo: Series[int] = pa.Field(ge=0, coerce=True)
     temp_c: Series[float] = pa.Field(
         ge=TEMP_C_MIN, le=TEMP_C_MAX, coerce=True, nullable=False
     )
@@ -70,58 +73,69 @@ class TelemetriaSchema(pa.DataFrameModel):
         ge=CLOCK_MHZ_MIN, le=CLOCK_MHZ_MAX, coerce=True, nullable=False
     )
     ecc_errors: Series[int] = pa.Field(ge=ECC_ERRORS_MIN, coerce=True)
-    estado: Series[str] = pa.Field(isin=ESTADOS_VALIDOS, coerce=True)
 
     class Config:
         strict = False  # permite columnas extra sin romper la validación
         coerce = True
 
 
-def validar_telemetria(df: pd.DataFrame) -> pd.DataFrame:
-    """Valida un DataFrame de telemetria cruda contra el contrato (estricto).
+class TelemetriaSchema(LecturaSchema):
+    """Contrato de datos para una fila de telemetria cruda del CSV de
+    entrenamiento: las señales de `LecturaSchema` mas los identificadores
+    del episodio y la etiqueta."""
 
-    Lanza `pandera.errors.SchemaErrors` (con el detalle de cada fila y
-    columna que incumple) si algo no cumple el contrato. Se usa
-    `lazy=True` para reportar TODOS los errores de una vez, no solo el
-    primero, lo cual es mucho mas util para depurar un dataset grande.
+    episodio_id: Series[int] = pa.Field(ge=0, coerce=True)
+    segundo: Series[int] = pa.Field(ge=0, coerce=True)
+    estado: Series[str] = pa.Field(isin=ESTADOS_VALIDOS, coerce=True)
 
-    Este es el modo que usa la API: una ventana que no cumple el contrato se
-    rechaza completa, sin intentar "arreglarla".
+
+def poner_en_cuarentena(
+    df: pd.DataFrame, schema: type[pa.DataFrameModel] = TelemetriaSchema
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Valida `df` contra `schema` y descarta las filas que violan el
+    contrato (p.ej. un sensor de potencia que por un instante reporta un
+    valor negativo durante una falla de alimentación), en vez de rechazar
+    TODO el DataFrame por un puñado de lecturas dañadas.
+
+    "Datos corruptos no deben entrar al pipeline" no siempre significa
+    "revienta si hay una sola fila mala": la respuesta operativa suele ser
+    filtrar la fila dañada y seguir, dejando constancia de qué se descartó y
+    por qué. Lo usan los dos lados, con el mismo criterio:
+    - `train.py` (via `validar_y_limpiar_telemetria`) sobre el CSV crudo.
+    - `api.py` con `LecturaSchema` sobre cada ventana que recibe: una
+      ventana de `falla_alimentacion` con una lectura de potencia negativa
+      sigue siendo una ventana de `falla_alimentacion`, no una petición
+      inválida.
+
+    Se usa `lazy=True` para recoger TODAS las violaciones de una vez, no
+    solo la primera.
+
+    Retorna (df_limpio, fallas): el DataFrame ya validado en modo estricto
+    tras quitar las filas problemáticas, y el detalle de qué fila violó qué
+    regla (vacío si no hubo ninguna).
     """
-    return TelemetriaSchema.validate(df, lazy=True)
+    try:
+        return schema.validate(df, lazy=True), pd.DataFrame()
+    except pa.errors.SchemaErrors as exc:
+        fallas = exc.failure_cases[["index", "column", "check", "failure_case"]]
+        indices_malos = sorted(set(fallas["index"].dropna().astype(int)))
+        df_limpio = df.drop(index=indices_malos).reset_index(drop=True)
+        # Se vuelve a validar en modo estricto: si sigue habiendo problemas
+        # (es decir, si la cuarentena no fue suficiente, p.ej. falta una
+        # columna entera), se deja que la excepción se propague en vez de
+        # seguir con datos sucios.
+        return schema.validate(df_limpio, lazy=True), fallas
 
 
 def validar_y_limpiar_telemetria(df: pd.DataFrame) -> pd.DataFrame:
-    """Valida el DataFrame y, si hay filas que violan el contrato (p.ej. un
-    sensor de potencia que por un instante reporta un valor negativo durante
-    una falla de alimentación), las pone en cuarentena: las reporta por
-    consola y las descarta, en vez de abortar TODO el entrenamiento por un
-    puñado de lecturas dañadas.
-
-    "Datos corruptos no deben entrar al pipeline" no siempre significa
-    "revienta si hay una sola fila mala" -- en un dataset real de miles de
-    filas, la respuesta operativa suele ser filtrar la fila dañada y seguir,
-    dejando constancia de qué se descartó y por qué. Por eso este modo es el
-    que usa `train.py` sobre el CSV crudo, mientras que la API usa el modo
-    estricto `validar_telemetria` (una ventana que llega mal formada a la
-    API se rechaza entera: no hay "más datos" con los que reemplazarla).
-
-    Retorna el DataFrame limpio (ya validado en modo estricto tras quitar
-    las filas problemáticas).
-    """
-    try:
-        return TelemetriaSchema.validate(df, lazy=True)
-    except pa.errors.SchemaErrors as exc:
-        indices_malos = sorted(set(exc.failure_cases["index"].dropna().astype(int)))
+    """Cuarentena sobre el CSV crudo de entrenamiento (ver
+    `poner_en_cuarentena`), reportando por consola qué filas se descartaron
+    y por qué."""
+    df_limpio, fallas = poner_en_cuarentena(df, TelemetriaSchema)
+    if not fallas.empty:
         print(
-            f"[schema] Se encontraron {len(indices_malos)} fila(s) que "
+            f"[schema] Se encontraron {len(df) - len(df_limpio)} fila(s) que "
             "incumplen el contrato de datos; se descartan antes de entrenar:"
         )
-        detalle = exc.failure_cases[["index", "column", "check", "failure_case"]]
-        print(detalle.to_string(index=False))
-
-        df_limpio = df.drop(index=indices_malos).reset_index(drop=True)
-        # Se vuelve a validar en modo estricto: si sigue habiendo problemas
-        # (es decir, si la cuarentena no fue suficiente), se deja que la
-        # excepción se propague en vez de entrenar sobre datos sucios.
-        return TelemetriaSchema.validate(df_limpio, lazy=True)
+        print(fallas.to_string(index=False))
+    return df_limpio

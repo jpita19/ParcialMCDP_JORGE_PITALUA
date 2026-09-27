@@ -44,8 +44,10 @@ por FastAPI, para probar `/predecir` a mano).
 
 Con la API arriba (Docker o local), `scripts/probar_api.py` manda una
 ventana real de cada estado (tomadas de `data/telemetria_publica.csv`) al
-endpoint `/predecir`, más una ventana de 3 lecturas para confirmar que se
-rechaza con `422`:
+endpoint `/predecir`, más tres casos de validación: una ventana de
+`falla_alimentacion` con una lectura de potencia negativa (debe predecirse
+igual), una con la temperatura en Fahrenheit y una de 3 lecturas (estas dos
+deben rechazarse con `422`):
 
 ```bash
 python scripts/probar_api.py
@@ -135,19 +137,24 @@ valores absurdos. `Config.strict = False` permite columnas extra en el
 DataFrame sin romper la validación (para no ser más rígidos de lo necesario
 con el resto del esquema).
 
-**Dos modos de validación, a propósito:**
-- `validar_telemetria()` (estricto) — revienta con `SchemaErrors` ante
-  cualquier violación. Es el que usa la API: una ventana mal formada de un
-  cliente se rechaza completa, porque no hay "más datos" con los que
-  arreglarla.
-- `validar_y_limpiar_telemetria()` (cuarentena) — pensado para el CSV de
-  entrenamiento. El dataset público trae 3 filas (de 14,400, ver EDA arriba)
-  con `power_w` negativo por un glitch de sensor durante
-  `falla_alimentacion`. Abortar todo el entrenamiento por un 0.02% de filas
-  dañadas no tiene sentido operativo: esta función reporta por consola
-  exactamente qué filas violan qué regla, las descarta, y valida de nuevo el
-  resto en modo estricto (si la cuarentena no alcanza, ahí sí se propaga el
-  error).
+**Dos contratos, un mismo criterio:**
+- `LecturaSchema` — solo las 5 señales con sus rangos físicos. Es lo que la
+  API aplica a cada ventana que recibe.
+- `TelemetriaSchema` — hereda de `LecturaSchema` y agrega `episodio_id`,
+  `segundo` y `estado`. Es el contrato del CSV de entrenamiento.
+
+Los dos se aplican con `poner_en_cuarentena()`: las filas que violan el
+contrato se descartan (dejando constancia de qué fila violó qué regla) y el
+resto se valida de nuevo en modo estricto (si la cuarentena no alcanza, por
+ejemplo porque falta una columna entera, ahí sí se propaga el error). El
+dataset público trae 3 filas (de 14,400, ver EDA arriba) con `power_w`
+negativo por un glitch de sensor durante `falla_alimentacion`. Abortar todo
+el entrenamiento por un 0.02% de filas dañadas no tiene sentido operativo, y
+por la misma razón la API tampoco rechaza una ventana entera por una lectura
+así: esa ventana sigue siendo de `falla_alimentacion`, y rechazarla sería
+perder justamente las ventanas de la falla que hay que detectar.
+`validar_y_limpiar_telemetria()` es el envoltorio que usa `train.py`, que
+además imprime el detalle de lo descartado.
 
 ## El pipeline de features (`src/features.py`, Parte A.1)
 
@@ -237,7 +244,7 @@ resuelve — Random Forest no le ganó a nadie acá. Se mantuvo como elección
 por: robustez esperada ante datos más ruidosos que los del examen oculto
 (traza fronteras no lineales por umbrales sin diseñar interacciones a mano),
 `feature_importances_` nativo (usado para identificar qué feature delata
-cada falla, ver sustentación), `predict_proba` sin calibración extra
+cada falla, ver [preguntas de sustentación](#preguntas-de-sustentación)), `predict_proba` sin calibración extra
 (necesario para `confianza`), y cero necesidad de tuning. La diferencia real
 entre modelos es velocidad de entrenamiento, irrelevante para 358 ventanas.
 
@@ -261,8 +268,9 @@ curl -X POST http://localhost:8000/predecir \
 {"estado_predicho": "sobrecalentamiento", "confianza": 0.98}
 ```
 
-Internamente: `VentanaTelemetria` (Pydantic) valida forma, tipos, rangos
-físicos y tamaño mínimo -> `features.calcular_features` (el mismo módulo de
+Internamente: `VentanaTelemetria` (Pydantic) valida forma, tipos y tamaño
+mínimo -> `LecturaSchema` (pandera) descarta las lecturas fuera de rango
+físico -> `features.calcular_features` (el mismo módulo de
 `train.py`) -> se reordenan las columnas según `feature_names` del artefacto
 serializado -> `pipeline.predict_proba` -> se responde la clase de mayor
 probabilidad y esa probabilidad como `confianza`.
@@ -274,15 +282,20 @@ confirmar que el contenedor ya cargó el modelo.
 
 ### Validación en la puerta (Parte B.2)
 
-- Cada `Lectura` exige los 5 campos, del tipo correcto y en rango físico —
-  los mismos límites del contrato de pandera (`schema.py`), importados como
-  constantes en vez de repetir los números, para que ambas validaciones
-  queden sincronizadas si algún rango cambia.
-- `VentanaTelemetria.lecturas` exige **mínimo `features.MIN_LECTURAS` (10)**
-  lecturas: con menos, la desviación estándar de la ventana no es confiable
-  y el modelo recibiría features de mala calidad.
-- Si algo no cumple, FastAPI responde `422` con el detalle exacto del campo
-  que falló, **sin tocar el modelo**.
+Dos capas, cada una con su responsabilidad:
+
+1. **Forma (Pydantic, `BaseModel`)** — cada `Lectura` exige los 5 campos y
+   del tipo correcto, y `VentanaTelemetria.lecturas` exige **mínimo
+   `features.MIN_LECTURAS` (10)** lecturas: con menos, la desviación
+   estándar de la ventana no es confiable y el modelo recibiría features de
+   mala calidad. Si algo no cumple, FastAPI responde `422` con el detalle
+   exacto del campo que falló.
+2. **Rangos físicos (pandera, `LecturaSchema`)** — el mismo contrato que se
+   usó al entrenar, no una copia de los números. Las lecturas fuera de
+   rango se descartan; si después quedan menos de 10 lecturas válidas, la
+   API responde `422` explicando cuántas quedaron.
+
+En ambos casos el rechazo ocurre **sin tocar el modelo**.
 
 ### Detalles de implementación
 
@@ -292,6 +305,49 @@ confirmar que el contenedor ya cargó el modelo.
 - `api.py` agrega su propio directorio a `sys.path` antes de importar
   `features`/`schema`, para no depender de si el proceso se levanta como
   `uvicorn api:app --app-dir src` o de otra forma.
+
+## Preguntas de sustentación
+
+**Una petición con una ventana de sobrecalentamiento.** Con la API arriba,
+`python scripts/probar_api.py` manda, entre otras, una ventana real de 30 s
+de `sobrecalentamiento` y responde
+`{"estado_predicho": "sobrecalentamiento", "confianza": 1.0}`. La
+`confianza` es la fracción de los 300 árboles del Random Forest que votaron
+por esa clase (`predict_proba`). Es 1.0 porque la ventana tiene `temp_c` de
+media ~88°C, y ninguna ventana de otra clase pasa de ~62°C (ver EDA).
+
+**¿Qué feature delata mejor la `falla_alimentacion`?** `clock_mhz_std`, la
+desviación estándar del reloj dentro de la ventana. En las ventanas de 30 s
+de entrenamiento va de 146 a 279 MHz para `falla_alimentacion` y nunca pasa
+de 105 MHz en las otras tres clases: un solo umbral la separa perfectamente.
+Tiene sentido físico: si la alimentación es inestable, la GPU no puede
+sostener una frecuencia fija y el reloj oscila. No es la media lo que la
+delata sino la inestabilidad; `power_w_std` apunta a lo mismo, con menos
+margen.
+
+**¿Qué hace la API con una ventana de 3 lecturas?** Responde `422` con un
+mensaje que dice que la lista necesita al menos 10 elementos, y no llama al
+modelo. Con 3 puntos, `std`, `min`, `max` y `range` son casi puro ruido, y
+el modelo aprendió con ventanas de 30 s: sus features estarían fuera de lo
+que conoce y la predicción sería una adivinanza con apariencia de respuesta.
+Es mejor un error claro que una predicción basura con confianza alta.
+
+**¿Por qué el modelo va dentro de la imagen?** Porque la imagen tiene que ser
+un artefacto reproducible e inmutable: la misma imagen da siempre las mismas
+predicciones. Si entrenara al arrancar, cada contenedor tendría un modelo
+potencialmente distinto, el arranque tardaría más, la imagen necesitaría los
+datos crudos adentro, y un error en el entrenamiento aparecería en
+producción en vez de antes. Se entrena una vez, se evalúa, se serializa y se
+copia el `.joblib`.
+
+**Si la temperatura llega en Fahrenheit, ¿el contrato lo atrapa?** En la
+práctica sí: una GPU en carga a 55–90°C son 131–194°F, fuera del rango de
+0–120 que exige `LecturaSchema`. Esas lecturas se descartan y, si toda la
+ventana viene así, quedan 0 válidas y la API responde `422` ("revisa las
+unidades"). `probar_api.py` lo comprueba. El hueco: una GPU en reposo por
+debajo de ~49°C da menos de 120°F, que sigue siendo un Celsius plausible, y
+pasaría. El contrato valida que el número sea físicamente posible, no la
+unidad; en producción convendría además que la fuente declare la unidad.
 
 ## Las trampas evitadas
 
